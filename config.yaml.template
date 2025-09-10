@@ -1,0 +1,45 @@
+admins:
+- YOUR_ADMIN_ID_1
+- YOUR_ADMIN_ID_2
+
+api:
+  ssl_verify: false  # 设置为 false 可以跳过SSL证书验证（仅用于解决证书问题）
+  data_sending:
+    daily_report:
+      enabled: true
+      report_type: 0
+      send_time: 05:45
+    hourly_report:
+      enabled: true
+      interval_minutes: 60
+      report_type: 0
+  login:
+    password: 'YOUR_PASSWORD'
+    totp_secret: YOUR_TOTP_SECRET_KEY
+    url: https://your-api-domain.com/api/Login/Login
+    username: YOUR_USERNAME
+
+bot:
+  token: YOUR_BOT_TOKEN
+
+google_sheets:
+  credentials_file: credentials.json
+  daily_sheet_name: BI后台日报数据
+  group_spreadsheets:
+    YOUR_GROUP_NAME: YOUR_SPREADSHEET_ID
+  hourly_sheet_name: BI后台时报数据
+
+groups:
+  YOUR_GROUP_NAME:
+    channel_ids:
+    - id: channel1
+    - id: channel2
+    - id: channel3
+    name: YOUR_GROUP_DISPLAY_NAME
+    tg_group: 'YOUR_TELEGRAM_GROUP_ID'
+
+settings:
+  forward_delay_ms: 1000
+  sending_interval:
+    batch_size: 20
+    delay_seconds: 2
