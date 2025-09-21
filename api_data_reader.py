@@ -4,9 +4,9 @@ import aiohttp
 from datetime import datetime, timedelta
 from typing import Dict, List, Any, Optional
 import pytz
-import matplotlib.pyplot as plt
 import pyotp
 import time
+from param_generator import ParamGenerator
 
 logger = logging.getLogger(__name__)
 
@@ -115,8 +115,111 @@ class ApiDataReader:
         totp = pyotp.TOTP(secret)
         return totp.now()
     
+    def generate_totp_codes_with_offsets(self, secret: str) -> list:
+        """生成多个时间窗口的TOTP验证码
+        
+        Args:
+            secret: TOTP密钥
+            
+        Returns:
+            包含不同时间偏移验证码的列表
+        """
+        totp = pyotp.TOTP(secret)
+        current_time = time.time()
+        codes = []
+        
+        # 生成前后几个时间窗口的验证码 (每个窗口30秒)
+        for offset in [-5, -4, -3, -2, -1, 0, 1, 2]:
+            timestamp = current_time + (offset * 30)
+            code = totp.at(timestamp)
+            codes.append({
+                'offset': offset,
+                'code': code,
+                'timestamp': timestamp
+            })
+        
+        return codes
+    
+    async def try_login_with_code(self, login_config: dict, totp_code: str) -> Optional[str]:
+        """使用指定验证码尝试登录
+        
+        Args:
+            login_config: 登录配置
+            totp_code: TOTP验证码
+            
+        Returns:
+            登录token，如果失败返回None
+        """
+        try:
+            # 准备登录请求数据（使用与auth_manager.py相同的格式）
+            login_data = {
+                'userName': login_config.get('username', ''),
+                'pwd': login_config.get('password', ''),
+                'vCode': totp_code,
+                'language': 'zh'
+            }
+            
+            # 添加通用参数（与auth_manager.py保持一致）
+            auto_generate_config = [
+                {"name": "timestamp", "type": "timestamp"},
+                {"name": "random", "type": "random", "length": 12},
+                {"name": "signature", "type": "signature"}
+            ]
+            
+            # 使用参数生成器添加通用参数
+            login_data = ParamGenerator.add_common_params(login_data, auto_generate_config)
+            
+            # 添加必要的headers
+            headers = {
+                'Content-Type': 'application/json',
+                'Domainurl': login_config.get('url', '').replace('/api/Login/Login', '')
+            }
+            
+            connector = self._create_ssl_connector()
+            async with aiohttp.ClientSession(connector=connector) as session:
+                async with session.post(
+                    login_config.get('url', ''),
+                    json=login_data,
+                    headers=headers
+                ) as response:
+                    if response.status == 200:
+                        result = await response.json()
+                        logger.debug(f"登录响应: {result}")
+                        
+                        # 检查响应格式（兼容不同的API响应格式）
+                        if result.get('success') and result.get('code') == 200:
+                            # 格式1: {success: true, code: 200, data: {token: ...}}
+                            token = result.get('data', {}).get('token')
+                        elif result.get('code') == 0 and result.get('msg') == 'Succeed':
+                            # 格式2: {code: 0, msg: 'Succeed', data: {token: ...}}
+                            token = result.get('data', {}).get('token')
+                        elif 'response' in result and 'data' in result['response'] and 'token' in result['response']['data']:
+                            # 格式3: {response: {data: {token: ...}}}
+                            token = result['response']['data']['token']
+                        else:
+                            # 检查错误信息
+                            error_msg = result.get('message') or result.get('msg') or result.get('response', {}).get('msg', '未知错误')
+                            logger.error(f"登录失败: {error_msg}")
+                            return None
+                        
+                        if token and token.strip():
+                            logger.info(f"使用验证码 {totp_code} 登录成功")
+                            return token
+                        else:
+                            logger.error("登录响应中未找到有效token")
+                            return None
+                    else:
+                        logger.error(f"登录请求失败，状态码: {response.status}")
+                        response_text = await response.text()
+                        logger.error(f"响应内容: {response_text}")
+                        return None
+                        
+        except Exception as e:
+            logger.error(f"尝试登录时出错: {str(e)}", exc_info=True)
+            return None
+
     async def login_and_get_token(self) -> Optional[str]:
-        """登录并获取token
+        """登录并获取token（支持多时间窗口重试）
         
         Returns:
             登录token，如果失败返回None
@@ -132,52 +235,69 @@ class ApiDataReader:
                 logger.error("未找到登录配置")
                 return None
             
-            # 生成TOTP验证码
-            totp_code = self.generate_totp_code(login_config.get('totp_secret', ''))
-            
-            # 准备登录请求数据
-            login_data = {
-                "username": login_config.get('username', ''),
-                "password": login_config.get('password', ''),
-                "code": totp_code
-            }
-            
             logger.info(f"正在登录，用户名: {login_config.get('username', '')}")
             
-            connector = self._create_ssl_connector()
-            async with aiohttp.ClientSession(connector=connector) as session:
-                async with session.post(
-                    login_config.get('url', ''),
-                    json=login_data,
-                    headers={'Content-Type': 'application/json'}
-                ) as response:
-                    if response.status == 200:
-                        result = await response.json()
-                        if result.get('success') and result.get('code') == 200:
-                            token = result.get('data', {}).get('token')
-                            if token:
-                                self.login_token = token
-                                # 设置token过期时间（24小时后）
-                                self.token_expiry = time.time() + 24 * 3600
-                                
-                                # 保存token到文件
-                                if self.config_loader.save_token_to_file(token, self.token_expiry):
-                                    logger.info("登录成功，已获取新token并保存到文件")
-                                else:
-                                    logger.warning("登录成功，但保存token到文件失败")
-                                
-                                return token
-                            else:
-                                logger.error("登录响应中未找到token")
-                        else:
-                            logger.error(f"登录失败: {result.get('message', '未知错误')}")
+            # 生成多个时间窗口的验证码
+            totp_secret = login_config.get('totp_secret', '')
+            if not totp_secret:
+                logger.error("TOTP密钥为空")
+                return None
+            
+            codes_info = self.generate_totp_codes_with_offsets(totp_secret)
+            
+            # 首先尝试当前时间的验证码
+            current_code = self.generate_totp_code(totp_secret)
+            logger.info(f"尝试当前验证码: {current_code}")
+            
+            token = await self.try_login_with_code(login_config, current_code)
+            if token:
+                # 登录成功，保存token
+                self.login_token = token
+                self.token_expiry = time.time() + 24 * 3600
+                
+                # 同步更新AuthManager的token缓存
+                from auth_manager import AuthManager
+                AuthManager._token_cache["main_login_token"] = token
+                logger.debug("已同步更新AuthManager token缓存")
+                
+                if self.config_loader.save_token_to_file(token, self.token_expiry):
+                    logger.info("登录成功，已获取新token并保存到文件")
+                else:
+                    logger.warning("登录成功，但保存token到文件失败")
+                
+                return token
+            
+            # 如果当前时间验证码失败，尝试其他时间窗口的验证码
+            logger.info("当前验证码登录失败，尝试其他时间窗口的验证码...")
+            for code_info in codes_info:
+                if code_info['code'] == current_code:
+                    continue  # 跳过已经尝试过的当前验证码
+                
+                logger.info(f"尝试偏移 {code_info['offset']} 的验证码: {code_info['code']}")
+                token = await self.try_login_with_code(login_config, code_info['code'])
+                if token:
+                    # 登录成功，保存token
+                    self.login_token = token
+                    self.token_expiry = time.time() + 24 * 3600
+                    
+                    # 同步更新AuthManager的token缓存
+                    from auth_manager import AuthManager
+                    AuthManager._token_cache["main_login_token"] = token
+                    logger.debug("已同步更新AuthManager token缓存")
+                    
+                    if self.config_loader.save_token_to_file(token, self.token_expiry):
+                        logger.info(f"使用偏移 {code_info['offset']} 的验证码登录成功，已保存token")
                     else:
-                        logger.error(f"登录请求失败，状态码: {response.status}")
+                        logger.warning("登录成功，但保存token到文件失败")
+                    
+                    return token
+            
+            logger.error("所有时间窗口的验证码都尝试失败")
+            return None
                         
         except Exception as e:
             logger.error(f"登录过程中出错: {str(e)}", exc_info=True)
-        
-        return None
+            return None
     
     def is_token_expired(self) -> bool:
         """检查token是否过期
@@ -307,7 +427,8 @@ class ApiDataReader:
             
             if 'error' not in response and response.get('status_code') == 200:
                 logger.info("包列表获取成功")
-                return response.get('response')
+                # 直接返回整个response，保持数据结构完整
+                return response
             else:
                 logger.error(f"包列表获取失败: {response}")
                 return None
@@ -385,13 +506,33 @@ class ApiDataReader:
             
             # 1. 获取包列表，建立ID和包名的对应关系
             package_list_response = await self.get_package_list()
-            if not package_list_response or 'data' not in package_list_response:
+            if not package_list_response:
                 logger.error("无法获取包列表数据")
+                return []
+            
+            # 从响应中提取数据，支持不同的响应格式
+            logger.debug(f"包列表响应结构: {list(package_list_response.keys()) if package_list_response else 'None'}")
+            
+            package_data = None
+            if 'response' in package_list_response and 'data' in package_list_response['response']:
+                # 格式1: {response: {data: {list: [...]}}}
+                package_data = package_list_response['response']['data']
+                logger.debug("使用格式1: response.response.data")
+            elif 'data' in package_list_response:
+                # 格式2: {data: {list: [...]}}
+                package_data = package_list_response['data']
+                logger.debug("使用格式2: response.data")
+            else:
+                logger.error(f"无法识别的响应格式，顶级字段: {list(package_list_response.keys()) if package_list_response else 'None'}")
+            
+            if not package_data:
+                logger.error("包列表响应中未找到数据字段")
+                logger.error(f"完整响应结构: {package_list_response}")
                 return []
             
             # 建立ID到包名的映射
             id_to_package_name = {}
-            package_list = package_list_response['data'].get('list', [])
+            package_list = package_data.get('list', [])
             for package in package_list:
                 package_id = package.get('id')
                 package_name = package.get('channelPackageName')
@@ -752,9 +893,6 @@ class ApiDataSender:
         self.batch_size = 5  # 每批发送的群组数量
         self.delay_seconds = 2  # 批次间的延迟时间（秒）
         
-        # 设置matplotlib中文字体
-        plt.rcParams['font.sans-serif'] = ['SimHei', 'Microsoft YaHei', 'DejaVu Sans']
-        plt.rcParams['axes.unicode_minus'] = False
     
     def update_config(self, config_loader):
         """更新配置加载器

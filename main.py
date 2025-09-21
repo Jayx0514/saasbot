@@ -159,7 +159,8 @@ class TelegramForwarderBot:
             
             if 'error' not in response and response.get('status_code') == 200:
                 logger.info("包列表获取成功")
-                return response.get('response')
+                # 直接返回整个response，保持数据结构完整
+                return response
             else:
                 logger.error(f"包列表获取失败: {response}")
                 return None
@@ -245,13 +246,26 @@ class TelegramForwarderBot:
             
             # 1. 获取包列表，建立ID和包名的对应关系
             package_list_response = await self.get_package_list()
-            if not package_list_response or 'data' not in package_list_response:
+            if not package_list_response:
                 logger.error("无法获取包列表数据")
+                return None
+            
+            # 从响应中提取数据，支持不同的响应格式
+            package_data = None
+            if 'response' in package_list_response and 'data' in package_list_response['response']:
+                # 格式1: {response: {data: {list: [...]}}}
+                package_data = package_list_response['response']['data']
+            elif 'data' in package_list_response:
+                # 格式2: {data: {list: [...]}}
+                package_data = package_list_response['data']
+            
+            if not package_data:
+                logger.error("包列表响应中未找到数据字段")
                 return None
             
             # 建立ID到包名的映射
             id_to_package_name = {}
-            package_list = package_list_response['data'].get('list', [])
+            package_list = package_data.get('list', [])
             for package in package_list:
                 package_id = package.get('id')
                 package_name = package.get('channelPackageName')

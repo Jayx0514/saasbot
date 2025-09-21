@@ -119,12 +119,20 @@ class AuthManager:
         # 首先尝试当前时间的验证码
         response = try_login_with_code(totp_code)
         
-        # 检查是否成功
-        if ('error' not in response and 'response' in response and 
-            'data' in response['response'] and 'token' in response['response']['data'] and
-            response['response']['data']['token']):
-            pass  # 当前时间窗口成功
-        else:
+        # 检查当前验证码是否成功（支持多种响应格式）
+        current_success = False
+        if 'error' not in response:
+            if ('response' in response and 'data' in response['response'] and 
+                'token' in response['response']['data'] and response['response']['data']['token']):
+                current_success = True
+            elif (response.get('code') == 0 and response.get('msg') == 'Succeed' and 
+                  response.get('data', {}).get('token')):
+                current_success = True
+            elif (response.get('success') and response.get('code') == 200 and 
+                  response.get('data', {}).get('token')):
+                current_success = True
+        
+        if not current_success:
             # 尝试其他时间窗口的验证码
             for window in time_windows:
                 if window['code'] == totp_code:
@@ -132,33 +140,54 @@ class AuthManager:
                     
                 response = try_login_with_code(window['code'])
                 
-                # 检查是否成功
-                if ('error' not in response and 'response' in response and 
-                    'data' in response['response'] and 'token' in response['response']['data'] and
-                    response['response']['data']['token']):
+                # 检查是否成功（支持多种响应格式）
+                success = False
+                if 'error' not in response:
+                    if ('response' in response and 'data' in response['response'] and 
+                        'token' in response['response']['data'] and response['response']['data']['token']):
+                        success = True
+                    elif (response.get('code') == 0 and response.get('msg') == 'Succeed' and 
+                          response.get('data', {}).get('token')):
+                        success = True
+                    elif (response.get('success') and response.get('code') == 200 and 
+                          response.get('data', {}).get('token')):
+                        success = True
+                
+                if success:
                     break  # 找到有效的验证码，退出循环
         
         if 'error' not in response:
+            token = None
+            expires_in = None
+            
+            # 检查不同的响应格式（与api_data_reader.py保持一致）
             if 'response' in response and 'data' in response['response'] and 'token' in response['response']['data']:
+                # 格式1: {response: {data: {token: ...}}}
                 token = response['response']['data']['token']
+                expires_in = response['response']['data'].get('expiresIn', time.time() + 24 * 3600)
+            elif response.get('code') == 0 and response.get('msg') == 'Succeed':
+                # 格式2: {code: 0, msg: 'Succeed', data: {token: ...}}
+                token = response.get('data', {}).get('token')
+                expires_in = response.get('data', {}).get('expiresIn', time.time() + 24 * 3600)
+            elif response.get('success') and response.get('code') == 200:
+                # 格式3: {success: true, code: 200, data: {token: ...}}
+                token = response.get('data', {}).get('token')
+                expires_in = response.get('data', {}).get('expiresIn', time.time() + 24 * 3600)
+            
+            if token and token.strip():
+                # 保存token到缓存
+                AuthManager._token_cache[cache_key] = token
                 
-                # 检查token是否为有效值（不为None且不为空字符串）
-                if token and token.strip():
-                    expires_in = response['response']['data'].get('expiresIn', time.time() + 24 * 3600)  # 默认24小时
-                    
-                    # 保存token到缓存
-                    AuthManager._token_cache[cache_key] = token
-                    
-                    # 保存token到文件（使用原有的保存机制）
-                    config_loader.save_token_to_file(token, expires_in)
-                    
-                    return token
-                else:
-                    # 检查是否有错误消息
-                    error_msg = response.get('response', {}).get('msg', 'Token无效')
-                    raise Exception(f"登录失败: {error_msg}")
+                # 保存token到文件（使用原有的保存机制）
+                config_loader.save_token_to_file(token, expires_in)
+                
+                return token
             else:
-                raise KeyError("响应格式不正确，未找到 token")
+                # 检查错误信息
+                error_msg = (response.get('response', {}).get('msg') or 
+                           response.get('msg') or 
+                           response.get('message', 'Token无效'))
+                raise Exception(f"登录失败: {error_msg}")
         else:
             raise Exception(f"获取token失败: {response.get('error')}")
     
